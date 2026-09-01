@@ -24,7 +24,8 @@ def get_valid_tokens():
     try:
         resp = requests.get(TOKEN_URL, timeout=5)
         resp.raise_for_status()
-        tokens = resp.json().get('tokens', [])
+        data = resp.json()
+        tokens = data.get('tokens', [])
         TOKEN_CACHE['tokens'] = tokens
         return tokens
     except Exception as e:
@@ -60,20 +61,11 @@ def fetch_and_cache_url():
         return None
 
 # --------------------- Routes ---------------------
-@app.route('/authorization/token', methods=['GET'])
-def handle_request():
-    # 1. Validate Authorization header
-    auth_header = request.headers.get('Authorization')
-    if not auth_header:
-        abort(403, description="Missing Authorization header")
-
-    parts = auth_header.split()
-    if len(parts) != 2 or parts[0].lower() != 'bearer':
-        abort(403, description="Invalid format. Expected 'Bearer <token>'")
-
-    client_token = parts[1]
+@app.route('/authorization/<token>', methods=['GET'])
+def handle_request(token):
+    # 1. Validate token from URL path
     valid_tokens = get_valid_tokens()
-    if client_token not in valid_tokens:
+    if token not in valid_tokens:
         abort(403, description="Invalid token")
 
     # 2. Get streaming URL (cached or fresh)
