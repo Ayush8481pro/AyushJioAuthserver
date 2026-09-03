@@ -2,6 +2,9 @@ import time
 import requests
 from flask import Flask, request, redirect, abort, jsonify
 from cachetools import TTLCache
+from datetime import datetime, timezone
+from collections import defaultdict
+from threading import Lock
 
 app = Flask(__name__)
 
@@ -9,11 +12,25 @@ app = Flask(__name__)
 TOKEN_CACHE = TTLCache(maxsize=1, ttl=300)          # 5 minutes
 URL_CACHE = TTLCache(maxsize=1, ttl=80)             # 80 seconds
 
+# New caches for catchup
+CATCHUP_PARAMS_CACHE = TTLCache(maxsize=1, ttl=86400)   # 24 hours
+CATCHUP_URL_CACHE = TTLCache(maxsize=10, ttl=80)        # 80 seconds
+
 TOKEN_URL = "https://raw.githubusercontent.com/Ayush8481Lab/Sar/refs/heads/main/app/data/access.json"
-DATA_URL = "https://ayushdatademo.onrender.com/app/live.php?id=173"
+DATA_URL = "https://ayushdatademo.onrender.com/app/live.php?id=183"
 
 ORIGINAL_DOMAIN = "jiotvbpkmob.cdn.jio.com"
 NEW_DOMAIN = "jiotvmblive.cdn.jio.com"
+
+# Catchup endpoints
+EPG_API_URL = "https://jiotvapi.cdn.jio.com/apis/v1.3/getepg/get?channel_id=173&offset=0"
+CATCHUP_API_URL = "https://ayushdatademo.onrender.com/app/catchup/cppapi.php"
+
+# Rate limiting
+RATE_LIMIT = 20
+RATE_WINDOW = 86400  # 24 hours in seconds
+rate_lock = Lock()
+token_requests = defaultdict(list)   # token -> list of timestamps
 
 # --------------------- Helper functions ---------------------
 def get_valid_tokens():
@@ -30,11 +47,10 @@ def get_valid_tokens():
         return tokens
     except Exception as e:
         print(f"Token fetch error: {e}")
-        # Return stale cache if available
         return TOKEN_CACHE.get('tokens', [])
 
 def get_cached_url():
-    """Return cached URL if still valid."""
+    """Return cached live stream URL if still valid."""
     if 'url_data' in URL_CACHE:
         return URL_CACHE['url_data'].get('original_url')
     return None
@@ -60,15 +76,100 @@ def fetch_and_cache_url():
         print(f"Upstream fetch error: {e}")
         return None
 
+def check_rate_limit(token):
+    """Check and record a request for the given token.
+    Returns True if allowed, False if rate limit exceeded."""
+    now = time.time()
+    with rate_lock:
+        # Remove old timestamps
+        token_requests[token] = [t for t in token_requests[token] if now - t < RATE_WINDOW]
+        if len(token_requests[token]) >= RATE_LIMIT:
+            return False
+        token_requests[token].append(now)
+        return True
+
+def epoch_ms_to_utc_str(epoch_ms):
+    """Convert epoch milliseconds to UTC string format YYYYMMDDTHHMMSS."""
+    dt_utc = datetime.fromtimestamp(epoch_ms / 1000, tz=timezone.utc)
+    return dt_utc.strftime("%Y%m%dT%H%M%S")
+
+def get_catchup_params():
+    """Get cached catchup parameters (srno, begin, end) or fetch from EPG."""
+    if 'params' in CATCHUP_PARAMS_CACHE:
+        return CATCHUP_PARAMS_CACHE['params']
+
+    # Fetch EPG data
+    try:
+        resp = requests.get(EPG_API_URL, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        epg_list = data.get('epg', [])
+        if not epg_list:
+            print("No EPG entries found")
+            return None
+
+        # Find the most recent entry that is catchup-available and has ended
+        now_ms = int(time.time() * 1000)
+        best_entry = None
+        for entry in epg_list:
+            if entry.get('isCatchupAvailable', False) and entry.get('endEpoch', 0) < now_ms:
+                if best_entry is None or entry['endEpoch'] > best_entry['endEpoch']:
+                    best_entry = entry
+        if best_entry is None:
+            # Fallback: pick any entry with isCatchupAvailable
+            for entry in epg_list:
+                if entry.get('isCatchupAvailable', False):
+                    best_entry = entry
+                    break
+
+        if best_entry is None:
+            print("No catchup-available entry found")
+            return None
+
+        params = {
+            'srno': best_entry['srno'],
+            'begin': epoch_ms_to_utc_str(best_entry['startEpoch']),
+            'end': epoch_ms_to_utc_str(best_entry['endEpoch'])
+        }
+        CATCHUP_PARAMS_CACHE['params'] = params
+        return params
+    except Exception as e:
+        print(f"EPG fetch error: {e}")
+        return None
+
+def get_catchup_url(params):
+    """Get cached catchup URL for given params or fetch from API."""
+    cache_key = f"{params['srno']}_{params['begin']}_{params['end']}"
+    if cache_key in CATCHUP_URL_CACHE:
+        return CATCHUP_URL_CACHE[cache_key]
+
+    try:
+        url = f"{CATCHUP_API_URL}?id=173&srno={params['srno']}&begin={params['begin']}&end={params['end']}"
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        catchup_url = resp.text.strip()
+        if not catchup_url:
+            print("Empty catchup URL received")
+            return None
+        CATCHUP_URL_CACHE[cache_key] = catchup_url
+        return catchup_url
+    except Exception as e:
+        print(f"Catchup API fetch error: {e}")
+        return None
+
 # --------------------- Routes ---------------------
 @app.route('/authorization/<token>', methods=['GET'])
 def handle_request(token):
-    # 1. Validate token from URL path
+    # 1. Validate token
     valid_tokens = get_valid_tokens()
     if token not in valid_tokens:
         abort(403, description="Invalid token")
 
-    # 2. Get streaming URL (cached or fresh)
+    # 2. Rate limit check
+    if not check_rate_limit(token):
+        abort(429, description="Rate limit exceeded (20/day)")
+
+    # 3. Get streaming URL (cached or fresh)
     video_url = get_cached_url()
     if not video_url:
         print("Cache miss, fetching from upstream...")
@@ -77,13 +178,38 @@ def handle_request(token):
     if not video_url:
         abort(503, description="Unable to obtain stream URL")
 
-    # 3. Redirect with proper caching headers for Render's edge cache
+    # 4. Redirect with proper caching headers
     response = redirect(video_url, code=302)
-    # Override Render's default 20‑minute cache for 302 responses
     response.headers['Cache-Control'] = 'public, max-age=80'
     return response
 
-# --------------------- Health check (for keep-alive) ---------------------
+@app.route('/Catchupauth/<token>', methods=['GET'])
+def handle_catchup(token):
+    # 1. Validate token
+    valid_tokens = get_valid_tokens()
+    if token not in valid_tokens:
+        abort(403, description="Invalid token")
+
+    # 2. Rate limit check
+    if not check_rate_limit(token):
+        abort(429, description="Rate limit exceeded (20/day)")
+
+    # 3. Get catchup parameters (cached or from EPG)
+    params = get_catchup_params()
+    if not params:
+        abort(503, description="Unable to obtain catchup parameters")
+
+    # 4. Get final catchup URL (cached or fetch)
+    catchup_url = get_catchup_url(params)
+    if not catchup_url:
+        abort(503, description="Unable to obtain catchup URL")
+
+    # 5. Redirect
+    response = redirect(catchup_url, code=302)
+    response.headers['Cache-Control'] = 'public, max-age=80'
+    return response
+
+# --------------------- Health check ---------------------
 @app.route('/')
 @app.route('/health')
 def health():
