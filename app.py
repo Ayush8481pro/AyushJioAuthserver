@@ -12,7 +12,7 @@ app = Flask(__name__)
 TOKEN_CACHE = TTLCache(maxsize=1, ttl=300)          # 5 minutes
 URL_CACHE = TTLCache(maxsize=1, ttl=80)             # 80 seconds
 
-# New caches for catchup
+# New caches for catchu
 CATCHUP_PARAMS_CACHE = TTLCache(maxsize=1, ttl=86400)   # 24 hours
 CATCHUP_URL_CACHE = TTLCache(maxsize=10, ttl=80)        # 80 seconds
 
