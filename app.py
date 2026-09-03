@@ -12,7 +12,7 @@ app = Flask(__name__)
 TOKEN_CACHE = TTLCache(maxsize=1, ttl=300)          # 5 minutes
 URL_CACHE = TTLCache(maxsize=1, ttl=80)             # 80 seconds
 
-# New caches for catchu
+# New caches for catchup
 CATCHUP_PARAMS_CACHE = TTLCache(maxsize=1, ttl=86400)   # 24 hours
 CATCHUP_URL_CACHE = TTLCache(maxsize=10, ttl=80)        # 80 seconds
 
@@ -94,11 +94,11 @@ def epoch_ms_to_utc_str(epoch_ms):
     return dt_utc.strftime("%Y%m%dT%H%M%S")
 
 def get_catchup_params():
-    """Get cached catchup parameters (srno, begin, end) or fetch from EPG."""
+    """Get cached catchup parameters (srno, begin, end) or fetch from EPG.
+    For verification, uses the FIRST EPG entry."""
     if 'params' in CATCHUP_PARAMS_CACHE:
         return CATCHUP_PARAMS_CACHE['params']
 
-    # Fetch EPG data
     try:
         resp = requests.get(EPG_API_URL, timeout=10)
         resp.raise_for_status()
@@ -108,28 +108,12 @@ def get_catchup_params():
             print("No EPG entries found")
             return None
 
-        # Find the most recent entry that is catchup-available and has ended
-        now_ms = int(time.time() * 1000)
-        best_entry = None
-        for entry in epg_list:
-            if entry.get('isCatchupAvailable', False) and entry.get('endEpoch', 0) < now_ms:
-                if best_entry is None or entry['endEpoch'] > best_entry['endEpoch']:
-                    best_entry = entry
-        if best_entry is None:
-            # Fallback: pick any entry with isCatchupAvailable
-            for entry in epg_list:
-                if entry.get('isCatchupAvailable', False):
-                    best_entry = entry
-                    break
-
-        if best_entry is None:
-            print("No catchup-available entry found")
-            return None
-
+        # Use the first entry for verification (ignore catchup availability and timing)
+        entry = epg_list[0]
         params = {
-            'srno': best_entry['srno'],
-            'begin': epoch_ms_to_utc_str(best_entry['startEpoch']),
-            'end': epoch_ms_to_utc_str(best_entry['endEpoch'])
+            'srno': entry['srno'],
+            'begin': epoch_ms_to_utc_str(entry['startEpoch']),
+            'end': epoch_ms_to_utc_str(entry['endEpoch'])
         }
         CATCHUP_PARAMS_CACHE['params'] = params
         return params
